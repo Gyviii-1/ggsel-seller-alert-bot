@@ -20,7 +20,7 @@ SELLER_URL = os.getenv(
     "SELLER_URL", f"https://ggsel.net/sellers/{SELLER_ID}"
 ).strip()
 CURRENCY = os.getenv("CURRENCY", "RUB").strip()
-LANG = os.getenv("LANG", "ru").strip()
+LANG = os.getenv("GGSEL_LANG", "ru").strip()
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
 
 API_URL = "https://api.ggsel.com/elastic/goods/sellers"

@@ -53,7 +53,7 @@ All settings come from environment variables (see `.env.example`):
 - `SELLER_ID` — numeric GGSel seller id (default `1348893`).
 - `SELLER_URL` — seller profile URL used in messages.
 - `CURRENCY` — price currency for the API (default `RUB`).
-- `LANG` — language for the API (default `ru`).
+- `GGSEL_LANG` — language for the API (default `ru`).
 
 ## Limits
 
