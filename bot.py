@@ -77,6 +77,9 @@ async def fetch_products(session):
         async with session.post(
             API_URL, json=body, headers=HEADERS, timeout=timeout
         ) as response:
+            if response.status != 200:
+                text = await response.text()
+                log.error("GGSel API %s: %s", response.status, text[:500])
             response.raise_for_status()
             payload = await response.json()
 
