@@ -2,12 +2,9 @@ import asyncio
 import json
 import logging
 import os
-import re
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
 
 import aiohttp
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,18 +15,28 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+SELLER_ID = os.getenv("SELLER_ID", "1348893").strip()
 SELLER_URL = os.getenv(
-    "SELLER_URL", "https://ggsel.net/sellers/1348893"
+    "SELLER_URL", f"https://ggsel.net/sellers/{SELLER_ID}"
 ).strip()
+CURRENCY = os.getenv("CURRENCY", "RUB").strip()
+LANG = os.getenv("LANG", "ru").strip()
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
-PRODUCT_HINTS = ("/item/", "/product/", "/goods/", "/lot/", "/catalog/")
+
+API_URL = "https://api.ggsel.com/elastic/goods/sellers"
+PRODUCT_URL_BASE = "https://ggsel.net/catalog/product/"
+PAGE_LIMIT = 60
+MAX_PAGES = 30
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/130.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "ru,en;q=0.8",
+    "Content-Type": "application/json",
+    "Origin": "https://ggsel.net",
+    "Referer": f"{SELLER_URL}",
 }
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -52,58 +59,57 @@ def save_state(state):
     )
 
 
-def extract_products(html, base_url):
-    """Best-effort parser for product links rendered in the seller page HTML."""
-    soup = BeautifulSoup(html, "html.parser")
+async def fetch_products(session):
+    """Return {product_id: {name, url, price}} for every listing of the seller."""
     products = {}
-    seller_path = urlparse(SELLER_URL).path.rstrip("/")
+    search_after = []
+    for _ in range(MAX_PAGES):
+        body = {
+            "id_seller": int(SELLER_ID),
+            "limit": PAGE_LIMIT,
+            "currency": CURRENCY,
+            "lang": LANG,
+            "with_filters": False,
+            "sort": "sortByRec",
+            "search_after": search_after,
+        }
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with session.post(
+            API_URL, json=body, headers=HEADERS, timeout=timeout
+        ) as response:
+            response.raise_for_status()
+            payload = await response.json()
 
-    for anchor in soup.find_all("a", href=True):
-        href = urljoin(base_url, anchor["href"].strip())
-        parsed = urlparse(href)
-        if (
-            parsed.scheme not in ("http", "https")
-            or parsed.netloc != urlparse(base_url).netloc
-        ):
-            continue
+        items = payload.get("data", {}).get("items", [])
+        for item in items:
+            product_id = item.get("id_goods")
+            if product_id is None:
+                continue
+            products[str(product_id)] = {
+                "name": (item.get("name") or "").strip(),
+                "url": PRODUCT_URL_BASE + (item.get("url") or ""),
+                "price": item.get("price_wmr"),
+                "unit": item.get("unit_name") or "",
+            }
 
-        path = parsed.path.rstrip("/")
-        if not path or path == seller_path or "/sellers/" in path:
-            continue
-
-        text = " ".join(anchor.get_text(" ", strip=True).split())
-        if not text or len(text) < 3:
-            continue
-
-        lowered = path.lower()
-        has_product_hint = any(hint in lowered for hint in PRODUCT_HINTS)
-        has_id = bool(re.search(r"(?:id=|/)[0-9]{4,}", href))
-        # Ignore navigation links; only keep links that resemble listing URLs.
-        if not (has_product_hint or has_id):
-            continue
-
-        key = href.split("#", 1)[0].rstrip("/")
-        products[key] = {"url": key, "title": text[:180]}
+        if len(items) < PAGE_LIMIT:
+            break
+        search_after = items[-1].get("sort") or []
+        if not search_after:
+            break
 
     return products
-
-
-async def fetch_products(session):
-    timeout = aiohttp.ClientTimeout(total=20)
-    async with session.get(SELLER_URL, headers=HEADERS, timeout=timeout) as response:
-        response.raise_for_status()
-        html = await response.text()
-    return extract_products(html, SELLER_URL)
 
 
 async def tg(session, method, **payload):
     url = f"{API_BASE}/{method}"
     timeout = aiohttp.ClientTimeout(total=20)
-    async with session.post(url, data=payload, timeout=timeout) as response:
-        try:
+    try:
+        async with session.post(url, data=payload, timeout=timeout) as response:
             return await response.json()
-        except Exception:
-            return {"ok": False}
+    except Exception as exc:
+        log.warning("Telegram %s failed: %s", method, exc)
+        return {"ok": False}
 
 
 async def send_message(session, chat_id, text):
@@ -132,7 +138,7 @@ async def collect_updates(session, state):
                 await send_message(
                     session,
                     chat_id,
-                    "Готово! Буду присылать новые товары продавца GGSel №1348893.",
+                    f"Готово! Буду присылать новые товары продавца GGSel №{SELLER_ID}.",
                 )
             else:
                 await send_message(session, chat_id, "Ты уже подписан на алерты.")
@@ -149,6 +155,15 @@ async def collect_updates(session, state):
             if chat_id in state["chat_ids"]:
                 state["chat_ids"].remove(chat_id)
                 await send_message(session, chat_id, "Отписал от алертов.")
+
+
+def format_price(price):
+    if price is None:
+        return "цена не указана"
+    try:
+        return f"{float(price):.2f} ₽"
+    except (TypeError, ValueError):
+        return str(price)
 
 
 async def main():
@@ -172,20 +187,21 @@ async def main():
             log.info("Initial baseline saved: %d product links", len(current))
         else:
             known = set(state["known_products"])
-            new_keys = sorted(current - known)
-            for key in new_keys:
-                product = products[key]
+            new_ids = sorted(current - known)
+            for product_id in new_ids:
+                product = products[product_id]
                 message = (
-                    "🔔 Новый товар у продавца GGSel №1348893!\n\n"
-                    f"📦 {product['title']}\n"
+                    f"🔔 Новый товар у продавца GGSel №{SELLER_ID}!\n\n"
+                    f"📦 {product['name']}\n"
+                    f"💰 {format_price(product['price'])}\n"
                     f"🔗 {product['url']}\n\n"
                     f"Профиль продавца: {SELLER_URL}"
                 )
                 for chat_id in state["chat_ids"]:
                     await send_message(session, chat_id, message)
             state["known_products"] = sorted(known | current)
-            if new_keys:
-                log.info("Found %d new product links", len(new_keys))
+            if new_ids:
+                log.info("Found %d new product links", len(new_ids))
 
         save_state(state)
 
