@@ -178,6 +178,7 @@ async def main():
     state = load_state()
     async with aiohttp.ClientSession() as session:
         await collect_updates(session, state)
+        save_state(state)
 
         products = await fetch_products(session)
         current = set(products)
