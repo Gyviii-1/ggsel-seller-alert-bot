@@ -9,8 +9,6 @@ from urllib.parse import urljoin, urlparse
 import aiohttp
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
 
 load_dotenv()
 logging.basicConfig(
@@ -23,7 +21,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SELLER_URL = os.getenv(
     "SELLER_URL", "https://ggsel.net/sellers/1348893"
 ).strip()
-CHECK_INTERVAL = max(60, int(os.getenv("CHECK_INTERVAL_SECONDS", "90")))
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
 PRODUCT_HINTS = ("/item/", "/product/", "/goods/", "/lot/", "/catalog/")
 HEADERS = {
@@ -34,13 +31,19 @@ HEADERS = {
     ),
     "Accept-Language": "ru,en;q=0.8",
 }
+API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
 def load_state():
     try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"known_products": [], "chat_ids": [], "initialized": False}
+        state = {}
+    state.setdefault("known_products", [])
+    state.setdefault("chat_ids", [])
+    state.setdefault("initialized", False)
+    state.setdefault("last_update_id", 0)
+    return state
 
 
 def save_state(state):
@@ -58,7 +61,10 @@ def extract_products(html, base_url):
     for anchor in soup.find_all("a", href=True):
         href = urljoin(base_url, anchor["href"].strip())
         parsed = urlparse(href)
-        if parsed.scheme not in ("http", "https") or parsed.netloc != urlparse(base_url).netloc:
+        if (
+            parsed.scheme not in ("http", "https")
+            or parsed.netloc != urlparse(base_url).netloc
+        ):
             continue
 
         path = parsed.path.rstrip("/")
@@ -90,110 +96,99 @@ async def fetch_products(session):
     return extract_products(html, SELLER_URL)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_chat:
-        return
-    state = load_state()
-    chat_id = update.effective_chat.id
-    if chat_id not in state["chat_ids"]:
-        state["chat_ids"].append(chat_id)
-        save_state(state)
-    await update.effective_message.reply_text(
-        "Готово! Буду отслеживать новые товары продавца GGSel №1348893.\n"
-        f"Проверка примерно раз в {CHECK_INTERVAL} сек.\n"
-        "Команды: /status — состояние, /check — проверить сейчас."
-    )
-
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = load_state()
-    await update.effective_message.reply_text(
-        f"Продавец: {SELLER_URL}\n"
-        f"Интервал: {CHECK_INTERVAL} сек.\n"
-        f"Известных товаров: {len(state['known_products'])}\n"
-        f"Первичная проверка выполнена: {'да' if state['initialized'] else 'нет'}"
-    )
-
-
-async def check_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("Проверяю страницу продавца…")
-    try:
-        async with aiohttp.ClientSession() as session:
-            products = await fetch_products(session)
-        await update.effective_message.reply_text(
-            f"В HTML страницы найдено ссылок, похожих на товары: {len(products)}.\n"
-            "Если на странице товары отображаются в браузере, но здесь их 0, "
-            "возможно, сайт загружает их через JavaScript — тогда потребуется "
-            "подстроить способ получения данных."
-        )
-    except Exception as exc:
-        log.exception("Manual check failed")
-        await update.effective_message.reply_text(
-            f"Не удалось проверить GGSel: {type(exc).__name__}: {exc}"
-        )
-
-
-async def monitor(app: Application):
-    await asyncio.sleep(5)
-    while True:
+async def tg(session, method, **payload):
+    url = f"{API_BASE}/{method}"
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with session.post(url, data=payload, timeout=timeout) as response:
         try:
-            async with aiohttp.ClientSession() as session:
-                products = await fetch_products(session)
-
-            state = load_state()
-            current = set(products)
-            known = set(state["known_products"])
-
-            # On first successful run, save the current page as baseline to avoid
-            # sending notifications for listings that were already there.
-            if not state["initialized"]:
-                state["known_products"] = sorted(current)
-                state["initialized"] = True
-                save_state(state)
-                log.info("Initial baseline saved: %d product links", len(current))
-            else:
-                new_keys = current - known
-                if new_keys:
-                    for key in sorted(new_keys):
-                        product = products[key]
-                        message = (
-                            "🔔 Новый товар у продавца GGSel №1348893!\n\n"
-                            f"📦 {product['title']}\n"
-                            f"🔗 {product['url']}\n\n"
-                            f"Профиль продавца: {SELLER_URL}"
-                        )
-                        for chat_id in load_state()["chat_ids"]:
-                            try:
-                                await app.bot.send_message(chat_id=chat_id, text=message)
-                            except Exception:
-                                log.exception("Could not notify chat %s", chat_id)
-                    state["known_products"] = sorted(known | current)
-                    save_state(state)
-                    log.info("Found %d new product links", len(new_keys))
-        except asyncio.CancelledError:
-            raise
+            return await response.json()
         except Exception:
-            log.exception("Seller check failed")
-
-        await asyncio.sleep(CHECK_INTERVAL)
+            return {"ok": False}
 
 
-async def post_init(app: Application):
-    app.create_task(monitor(app), name="ggsel-seller-monitor")
+async def send_message(session, chat_id, text):
+    await tg(session, "sendMessage", chat_id=chat_id, text=text)
 
 
-def main():
+async def collect_updates(session, state):
+    """Process pending Telegram updates so /start works in one-shot mode."""
+    offset = int(state.get("last_update_id", 0)) + 1
+    data = await tg(session, "getUpdates", offset=offset, timeout=0)
+    if not isinstance(data, dict) or not data.get("ok"):
+        return
+    for update in data.get("result", []):
+        state["last_update_id"] = max(
+            int(state["last_update_id"]), int(update["update_id"])
+        )
+        message = update.get("message") or update.get("edited_message") or {}
+        text = (message.get("text") or "").strip()
+        chat_id = (message.get("chat") or {}).get("id")
+        if chat_id is None:
+            continue
+
+        if text.startswith("/start"):
+            if chat_id not in state["chat_ids"]:
+                state["chat_ids"].append(chat_id)
+                await send_message(
+                    session,
+                    chat_id,
+                    "Готово! Буду присылать новые товары продавца GGSel №1348893.",
+                )
+            else:
+                await send_message(session, chat_id, "Ты уже подписан на алерты.")
+        elif text.startswith("/status"):
+            await send_message(
+                session,
+                chat_id,
+                f"Продавец: {SELLER_URL}\n"
+                f"Известных товаров: {len(state['known_products'])}\n"
+                f"Подписчиков: {len(state['chat_ids'])}\n"
+                f"База собрана: {'да' if state['initialized'] else 'нет'}",
+            )
+        elif text.startswith("/stop"):
+            if chat_id in state["chat_ids"]:
+                state["chat_ids"].remove(chat_id)
+                await send_message(session, chat_id, "Отписал от алертов.")
+
+
+async def main():
     if not BOT_TOKEN:
         raise SystemExit(
-            "BOT_TOKEN is missing. Copy .env.example to .env and set your Telegram bot token."
+            "BOT_TOKEN отсутствует. Задай переменную окружения BOT_TOKEN."
         )
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("check", check_now))
-    log.info("Bot started; seller page: %s", SELLER_URL)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    state = load_state()
+    async with aiohttp.ClientSession() as session:
+        await collect_updates(session, state)
+
+        products = await fetch_products(session)
+        current = set(products)
+
+        # On the first successful run, save the current page as baseline so we
+        # do not notify about listings that were already there.
+        if not state["initialized"]:
+            state["known_products"] = sorted(current)
+            state["initialized"] = True
+            log.info("Initial baseline saved: %d product links", len(current))
+        else:
+            known = set(state["known_products"])
+            new_keys = sorted(current - known)
+            for key in new_keys:
+                product = products[key]
+                message = (
+                    "🔔 Новый товар у продавца GGSel №1348893!\n\n"
+                    f"📦 {product['title']}\n"
+                    f"🔗 {product['url']}\n\n"
+                    f"Профиль продавца: {SELLER_URL}"
+                )
+                for chat_id in state["chat_ids"]:
+                    await send_message(session, chat_id, message)
+            state["known_products"] = sorted(known | current)
+            if new_keys:
+                log.info("Found %d new product links", len(new_keys))
+
+        save_state(state)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

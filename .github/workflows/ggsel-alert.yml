@@ -1,0 +1,41 @@
+name: GGSel seller alert
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ggsel-seller-alert
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore bot state
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: ggsel-state-${{ github.run_id }}
+          restore-keys: |
+            ggsel-state-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run one check
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: python bot.py
